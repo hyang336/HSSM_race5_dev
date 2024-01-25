@@ -18,26 +18,34 @@ outdir='/scratch/hyang336/working_dir/HSSM_dev/race_4_LAN/'
 #function, evaluated at the parameters for the beta distribution (a and b). This intercept was the normalizing factor
 #before the log transformation to make sure the function was a distibution (i.e. integrate to 1). Note, larger values
 #of a or b will result in large positive or negative value of v down the line, may need to find a way to rescale it...
-a0=0.4
+a0=0.1
 b0=1
-intercept0=np.log(1/beta(a0,b0))
+#intercept0=np.log(1/beta(a0,b0))
+intercept0=1
+
 a1=1.5
 b1=3
-intercept1=np.log(1/beta(a1,b1))
+#intercept1=np.log(1/beta(a1,b1))
+intercept1=3.5
+
 a2=3
 b2=1.5
-intercept2=np.log(1/beta(a2,b2))
+#intercept2=np.log(1/beta(a2,b2))
+intercept2=3.5
+
 a3=1
-b3=0.4
-intercept3=np.log(1/beta(a3,b3))
+b3=0.1
+#intercept3=np.log(1/beta(a3,b3))
+intercept3=1
+
 simneural = np.random.uniform(0, 1, size=2000)
 
 #simulate linear relationship between v and log-transformed neural data, following HSSM tutorial (i.e. no added noise at this step)
 #now we need a log link function since we model log(v)=a+b*log(x)+c*log(1-x)
-v0=np.exp(intercept0 + (a0-1)*np.log(simneural) + (b0-1)*np.log(1-simneural))
-v1=np.exp(intercept1 + (a1-1)*np.log(simneural) + (b1-1)*np.log(1-simneural))
-v2=np.exp(intercept2 + (a2-1)*np.log(simneural) + (b2-1)*np.log(1-simneural))
-v3=np.exp(intercept3 + (a3-1)*np.log(simneural) + (b3-1)*np.log(1-simneural))
+v0=np.exp(intercept0 + a0*np.log(simneural) + b0*np.log(1-simneural))
+v1=np.exp(intercept1 + a1*np.log(simneural) + b1*np.log(1-simneural))
+v2=np.exp(intercept2 + a2*np.log(simneural) + b2*np.log(1-simneural))
+v3=np.exp(intercept3 + a3*np.log(simneural) + b3*np.log(1-simneural))
 
 ###IMPORTANT: for interpretable param rec test, make sure generate params within training bounds of LAN###
 
