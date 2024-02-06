@@ -107,6 +107,7 @@ model_race4_v = hssm.HSSM(
     data=dataset_race4_v,
     model='race_no_bias_angle_4',
     a=1.5,
+    z=0.0,
     include=[
         {
             "name": "v0",
@@ -144,7 +145,7 @@ infer_data_race4_v = model_race4_v.sample(
 )
 
 #save model
-az.to_netcdf(infer_data_race4_v,outdir+'sample_10000_10000_trace_ParamInbound_Fixed_a_SliceSampler.nc4')
+az.to_netcdf(infer_data_race4_v,outdir+'sample_10000_10000_trace_ParamInbound_Fixed_az_SliceSampler.nc4')
 
 #load model
 #infer_data_race4_v=az.from_netcdf('/home/hyang336/HSSM_race5_dev/HY_dev/race_4_LAN/sample50_trace.nc4')
@@ -154,11 +155,11 @@ az.plot_trace(
     infer_data_race4_v,
     var_names="~log_likelihood",  # we exclude the log_likelihood traces here
 )
-plt.savefig(outdir+'posterior_diagnostic_10000_10000_trace_ParamInbound_Fixed_a_SliceSampler.png')
+plt.savefig(outdir+'posterior_diagnostic_10000_10000_trace_ParamInbound_Fixed_az_SliceSampler.png')
 
 #fit summary
 res_sum=az.summary(model_race4_v.traces)
-res_sum.to_csv(outdir+'summary_10000_10000_trace_ParamInbound_Fixed_a_SliceSampler.csv')
+res_sum.to_csv(outdir+'summary_10000_10000_trace_ParamInbound_Fixed_az_SliceSampler.csv')
 #res_slope=res_sum[res_sum.iloc[:,0].str.contains("_x|_y")]
 #res_sum.loc[['v0_x','v0_y','v1_x','v1_y','v2_x','v2_y','v3_x','v3_y']]
 
