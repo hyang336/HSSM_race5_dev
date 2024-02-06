@@ -2,11 +2,18 @@ import bambi as bmb
 import numpy as np
 import pymc as pm
 import pytest
+import pytensor.tensor as pt
 
 import hssm
 from hssm import distribution_utils
-from hssm.distribution_utils.dist import apply_param_bounds_to_loglik, make_distribution
+from hssm.distribution_utils.dist import (
+    apply_param_bounds_to_loglik,
+    make_distribution,
+    ensure_positive_ndt,
+)
 from hssm.likelihoods.analytical import logp_ddm, DDM
+
+hssm.set_floatX("float32")
 
 
 def test_make_ssm_rv():
@@ -58,6 +65,9 @@ def test_lapse_distribution():
     )
 
     assert random_sample_1.shape == (10, 2)
+    assert -1.0 in random_sample_1[:, 1]
+    assert 1.0 in random_sample_1[:, 1]
+    assert 0 not in random_sample_1[:, 1]
 
     rng1 = np.random.default_rng(10)
     rng2 = np.random.default_rng(10)
@@ -117,9 +127,10 @@ def test_apply_param_bounds_to_loglik():
 def test_make_distribution():
     def fake_logp_function(data, param1, param2):
         """Make up a fake log likelihood function for this test only."""
-        return data * param1 * param2
+        return data[:, 0] * param1 * param2
 
-    data = np.random.normal(size=1000)
+    data = np.zeros((1000, 2))
+    data[:, 0] = np.random.normal(size=1000)
     bounds = {"param1": [-1.0, 1.0], "param2": [-1.0, 1.0]}
 
     Dist = make_distribution(
@@ -137,7 +148,7 @@ def test_make_distribution():
 
     np.testing.assert_array_equal(
         Dist.logp(data, scalar_in_bound, scalar_in_bound).eval(),
-        data * scalar_in_bound * scalar_in_bound,
+        data[:, 0] * scalar_in_bound * scalar_in_bound,
     )
 
     np.testing.assert_array_equal(
@@ -151,16 +162,16 @@ def test_make_distribution():
 
     np.testing.assert_array_equal(
         results_vector[~out_of_bound_indices],
-        data[~out_of_bound_indices]
+        data[:, 0][~out_of_bound_indices]
         * scalar_in_bound
         * random_vector[~out_of_bound_indices],
     )
 
 
 def test_extra_fields(data_ddm):
-    ones = np.ones(len(data_ddm))
+    ones = np.ones(data_ddm.shape[0])
     x = ones * 0.5
-    y = ones * 2
+    y = ones * 4.0
 
     def logp_ddm_extra_fields(data, v, a, z, t, x, y):
         return logp_ddm(data, v, a, z, t) * x * y
@@ -176,7 +187,7 @@ def test_extra_fields(data_ddm):
 
     np.testing.assert_almost_equal(
         pm.logp(DDM.dist(**true_values), data_ddm).eval(),
-        pm.logp(DDM_WITH_XY.dist(**true_values), data_ddm).eval(),
+        pm.logp(DDM_WITH_XY.dist(**true_values), data_ddm).eval() / 2.0,
     )
 
     data_ddm_copy = data_ddm.copy()
@@ -184,24 +195,56 @@ def test_extra_fields(data_ddm):
     data_ddm_copy["y"] = y
 
     ddm_model_xy = hssm.HSSM(
-        data=data_ddm_copy, model_config=dict(extra_fields=["x", "y"]), p_outlier=None
+        data=data_ddm_copy,
+        model_config=dict(extra_fields=["x", "y"]),
+        loglik=logp_ddm_extra_fields,
+        p_outlier=None,
+        lapse=None,
     )
 
     np.testing.assert_almost_equal(
         pm.logp(DDM.dist(**true_values), data_ddm).eval(),
-        pm.logp(ddm_model_xy.model_distribution.dist(**true_values), data_ddm).eval(),
+        pm.logp(ddm_model_xy.model_distribution.dist(**true_values), data_ddm).eval()
+        / 2.0,
     )
 
     ddm_model = hssm.HSSM(data=data_ddm)
     ddm_model_p = hssm.HSSM(
-        data=data_ddm_copy, model_config=dict(extra_fields=["x", "y"])
+        data=data_ddm_copy,
+        model_config=dict(extra_fields=["x", "y"]),
+        loglik=logp_ddm_extra_fields,
+    )
+    ddm_model_p_logp_without_lapse = (
+        pm.logp(
+            ddm_model_p.model_distribution.dist(**true_values, p_outlier=0),
+            data_ddm,
+        )
+        / 2
+    )
+    ddm_model_p_logp_lapse = pt.log(
+        0.95 * pt.exp(ddm_model_p_logp_without_lapse)
+        + 0.05
+        * pt.exp(pm.logp(pm.Uniform.dist(lower=0.0, upper=10.0), data_ddm["rt"].values))
     )
     np.testing.assert_almost_equal(
         pm.logp(
             ddm_model.model_distribution.dist(**true_values, p_outlier=0.05), data_ddm
         ).eval(),
-        pm.logp(
-            ddm_model_p.model_distribution.dist(**true_values, p_outlier=0.05),
-            data_ddm,
-        ).eval(),
+        ddm_model_p_logp_lapse.eval(),
     )
+
+
+def test_ensure_positive_ndt():
+    data = np.zeros((1000, 2))
+    data[:, 0] = np.random.uniform(size=1000)
+
+    logp = np.random.uniform(size=1000)
+
+    list_params = ["v", "a", "z", "t"]
+    dist_params = [0.5] * 4
+
+    after_replacement = ensure_positive_ndt(data, logp, list_params, dist_params).eval()
+    mask = data[:, 0] - 0.5 <= 1e-15
+
+    assert np.all(after_replacement[mask] == np.array(-66.1))
+    assert np.all(after_replacement[~mask] == logp[~mask])

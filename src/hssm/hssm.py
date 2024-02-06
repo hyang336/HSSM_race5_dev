@@ -6,18 +6,30 @@ sequential sampling models.
 This file defines the entry class HSSM.
 """
 
-from __future__ import annotations
-
 import logging
+from copy import deepcopy
 from inspect import isclass
+from os import PathLike
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Literal
+from typing import Any, Callable, Literal
 
+import arviz as az
 import bambi as bmb
+import matplotlib as mpl
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
 import pymc as pm
 import pytensor
+import seaborn as sns
+import xarray as xr
 from bambi.model_components import DistributionalComponent
+from bambi.transformations import transformations_namespace
 
+from hssm.defaults import (
+    LoglikKind,
+    SupportedModels,
+)
 from hssm.distribution_utils import (
     make_blackbox_op,
     make_distribution,
@@ -32,23 +44,13 @@ from hssm.utils import (
     HSSMModelGraph,
     _print_prior,
     _process_param_in_kwargs,
+    _random_sample,
     download_hf,
     get_alias_dict,
 )
 
+from . import plotting
 from .config import Config, ModelConfig
-
-if TYPE_CHECKING:
-    from os import PathLike
-
-    import arviz as az
-    import numpy as np
-    import pandas as pd
-
-    from hssm.defaults import (
-        LoglikKind,
-        SupportedModels,
-    )
 
 _logger = logging.getLogger("hssm")
 
@@ -140,7 +142,32 @@ class HSSM:
     hierarchical : optional
         If True, and if there is a `participant_id` field in `data`, will by default
         turn any unspecified parameter theta into a regression with
-        "theta ~ 1 + (1|participant_id)" and default priors set by `bambi`.
+        "theta ~ 1 + (1|participant_id)" and default priors set by `bambi`. Also changes
+        default values of `link_settings` and `prior_settings`. Defaults to False.
+    link_settings : optional
+        An optional string literal that indicates the link functions to use for each
+        parameter. Helpful for hierarchical models where sampling might get stuck/
+        very slow. Can be one of the following:
+
+        - `"log_logit"`: applies log link functions to positive parameters and
+        generalized logit link functions to parameters that have explicit bounds.
+        - `None`: unless otherwise specified, the `"identity"` link functions will be
+        used.
+        The default value is `None`.
+    prior_settings : optional
+        An optional string literal that indicates the prior distributions to use for
+        each parameter. Helpful for hierarchical models where sampling might get stuck/
+        very slow. Can be one of the following:
+
+        - `"safe"`: HSSM will scan all parameters in the model and apply safe priors to
+        all parameters that do not have explicit bounds.
+        - `None`: HSSM will use bambi to provide default priors for all parameters. Not
+        recommended when you are using hierarchical models.
+        The default value is `None` when `hierarchical` is `False` and `"safe"` when
+        `hierarchical` is `True`.
+    extra_namespace : optional
+        Additional user supplied variables with transformations or data to include in
+        the environment where the formula is evaluated. Defaults to `None`.
     **kwargs
         Additional arguments passed to the `bmb.Model` object.
 
@@ -188,12 +215,41 @@ class HSSM:
         loglik_kind: LoglikKind | None = None,
         p_outlier: float | dict | bmb.Prior | None = 0.05,
         lapse: dict | bmb.Prior | None = bmb.Prior("Uniform", lower=0.0, upper=10.0),
-        hierarchical: bool = True,
+        hierarchical: bool = False,
+        link_settings: Literal["log_logit"] | None = None,
+        prior_settings: Literal["safe"] | None = None,
+        extra_namespace: dict[str, Any] | None = None,
         **kwargs,
     ):
         self.data = data
         self._inference_obj = None
-        self.hierarchical = hierarchical and "participant_id" in data.columns
+        self.hierarchical = hierarchical
+
+        if self.hierarchical and "participant_id" not in self.data.columns:
+            raise ValueError(
+                "You have specified a hierarchical model, but there is no "
+                + "`participant_id` field in the DataFrame that you have passed."
+            )
+
+        if self.hierarchical and prior_settings is None:
+            prior_settings = "safe"
+
+        self.link_settings = link_settings
+        self.prior_settings = prior_settings
+
+        additional_namespace = transformations_namespace.copy()
+        if extra_namespace is not None:
+            additional_namespace.update(extra_namespace)
+        self.additional_namespace = additional_namespace
+
+        responses = self.data["response"].unique().astype(int)
+        self.n_responses = len(responses)
+        if self.n_responses == 2:
+            if -1 not in responses or 1 not in responses:
+                raise ValueError(
+                    "The response column must contain only -1 and 1 when there are "
+                    + "two responses."
+                )
 
         # Construct a model_config from defaults
         self.model_config = Config.from_defaults(model, loglik_kind)
@@ -237,6 +293,7 @@ class HSSM:
         self._parent, self._parent_param = self._find_parent()
         assert self._parent_param is not None
 
+        self._override_defaults()
         self._process_all()
 
         # Get the bambi formula, priors, and link
@@ -265,7 +322,12 @@ class HSSM:
         )
 
         self.model = bmb.Model(
-            self.formula, data, family=self.family, priors=self.priors, **other_kwargs
+            self.formula,
+            data=data,
+            family=self.family,
+            priors=self.priors,
+            extra_namespace=extra_namespace,
+            **other_kwargs,
         )
 
         self._aliases = get_alias_dict(self.model, self._parent_param)
@@ -275,6 +337,7 @@ class HSSM:
         self,
         sampler: Literal["mcmc", "nuts_numpyro", "nuts_blackjax", "laplace", "vi"]
         | None = None,
+        init: str | None = None,
         **kwargs,
     ) -> az.InferenceData | pm.Approximation:
         """Perform sampling using the `fit` method via bambi.Model.
@@ -288,6 +351,9 @@ class HSSM:
             sampler will automatically be chosen: when the model uses the
             `approx_differentiable` likelihood, and `jax` backend, "nuts_numpyro" will
             be used. Otherwise, "mcmc" (the default PyMC NUTS sampler) will be used.
+        init: optional
+            Initialization method to use for the sampler. If any of the NUTS samplers
+            is used, defaults to `"adapt_diag"`. Otherwise, defaults to `"auto"`.
         kwargs
             Other arguments passed to bmb.Model.fit(). Please see [here]
             (https://bambinos.github.io/bambi/api_reference.html#bambi.models.Model.fit)
@@ -323,7 +389,7 @@ class HSSM:
                 )
 
             if "step" not in kwargs:
-                kwargs["step"] = pm.Slice(model=self.pymc_model)
+                kwargs |= {"step": pm.Slice(model=self.pymc_model)}
 
         if (
             self.loglik_kind == "approx_differentiable"
@@ -340,7 +406,15 @@ class HSSM:
         if self._check_extra_fields():
             self._update_extra_fields()
 
-        self._inference_obj = self.model.fit(inference_method=sampler, **kwargs)
+        if init is None:
+            if sampler in ["mcmc", "nuts_numpyro", "nuts_blackjax"]:
+                init = "adapt_diag"
+            else:
+                init = "auto"
+
+        self._inference_obj = self.model.fit(
+            inference_method=sampler, init=init, **kwargs
+        )
 
         return self.traces
 
@@ -351,6 +425,7 @@ class HSSM:
         inplace: bool = True,
         include_group_specific: bool = True,
         kind: Literal["pps", "mean"] = "pps",
+        n_samples: int | float | None = None,
     ) -> az.InferenceData | None:
         """Perform posterior predictive sampling from the HSSM model.
 
@@ -376,6 +451,17 @@ class HSSM:
             latter returns the draws from the posterior predictive distribution
             (i.e. the posterior probability distribution for a new observation).
             Defaults to `"pps"`.
+        n_samples
+            The number of samples to draw from the posterior predictive distribution
+            from each chain.
+            When it's an integer >= 1, the number of samples to be extracted from the
+            `draw` dimension. If this integer is larger than the number of posterior
+            samples in each chain, all posterior samples will be used
+            in posterior predictive sampling. When a float between 0 and 1, the
+            proportion of samples from the draw dimension from each chain to be used in
+            posterior predictive sampling.. If this proportion is very
+            small, at least one sample will be used. When None, all posterior samples
+            will be used. Defaults to None.
 
         Raises
         ------
@@ -398,7 +484,58 @@ class HSSM:
         if self._check_extra_fields(data):
             self._update_extra_fields(data)
 
+        if n_samples is not None:
+            # Make a copy of idata, set the `posterior` group to be a random sub-sample
+            # of the original (draw dimension gets sub-sampled)
+            idata_copy = idata.copy()
+            idata_random_sample = _random_sample(
+                idata_copy["posterior"], n_samples=n_samples
+            )
+            delattr(idata_copy, "posterior")
+            idata_copy.add_groups(posterior=idata_random_sample)
+
+            # If the user specifies an inplace operation, we need to modify the original
+            if inplace:
+                self.model.predict(idata_copy, kind, data, True, include_group_specific)
+                idata.add_groups(
+                    posterior_predictive=idata_copy["posterior_predictive"]
+                )
+
+                return None
+
+            return self.model.predict(
+                idata_copy, kind, data, False, include_group_specific
+            )
+
         return self.model.predict(idata, kind, data, inplace, include_group_specific)
+
+    def plot_posterior_predictive(self, **kwargs) -> mpl.axes.Axes | sns.FacetGrid:
+        """Produce a posterior predictive plot.
+
+        Equivalent to calling `hssm.plotting.plot_posterior_predictive()` with the
+        model. Please see that function for
+        [full documentation][hssm.plotting.plot_posterior_predictive].
+
+        Returns
+        -------
+        mpl.axes.Axes | sns.FacetGrid
+            The matplotlib axis or seaborn FacetGrid object containing the plot.
+        """
+        return plotting.plot_posterior_predictive(self, **kwargs)
+
+    def plot_quantile_probability(self, **kwargs) -> mpl.axes.Axes | sns.FacetGrid:
+        """Produce a quantile probability plot.
+
+        Equivalent to calling `hssm.plotting.plot_quantile_probability()` with the
+        model. Please see that function for
+        [full documentation][hssm.plotting.plot_quantile_probability].
+
+        Returns
+        -------
+        mpl.axes.Axes | sns.FacetGrid
+            The matplotlib axis or seaborn FacetGrid object containing the plot.
+        """
+        return plotting.plot_quantile_probability(self, **kwargs)
 
     def sample_prior_predictive(
         self,
@@ -512,6 +649,103 @@ class HSSM:
             return graphviz_
 
         return graphviz
+
+    def plot_trace(
+        self,
+        data: az.InferenceData | None = None,
+        include_deterministic: bool = False,
+        tight_layout: bool = True,
+        **kwargs,
+    ) -> None:
+        """Generate trace plot with ArviZ but with additional convenience features.
+
+        This is a simple wrapper for the az.plot_trace() function. By default, it
+        filters out the deterministic values from the plot. Please see the
+        [arviz documentation]
+        (https://arviz-devs.github.io/arviz/api/generated/arviz.plot_trace.html)
+        for additional parameters that can be specified.
+
+        Parameters
+        ----------
+        data : optional
+            An ArviZ InferenceData object. If None, the traces stored in the model will
+            be used.
+        include_deterministic : optional
+            Whether to include deterministic variables in the plot. Defaults to False.
+            Note that if include deterministic is set to False and and `var_names` is
+            provided, the `var_names` provided will be modified to also exclude the
+            deterministic values. If this is not desirable, set
+            `include deterministic` to True.
+        tight_layout : optional
+            Whether to call plt.tight_layout() after plotting. Defaults to True.
+        """
+        data = data or self.traces
+
+        if not include_deterministic:
+            var_names = self._get_deterministic_var_names(data)
+            if var_names:
+                if "var_names" in kwargs:
+                    if isinstance(kwargs["var_names"], str):
+                        if kwargs["var_names"] not in var_names:
+                            var_names.append(kwargs["var_names"])
+                        kwargs["var_names"] = var_names
+                    elif isinstance(kwargs["var_names"], list):
+                        kwargs["var_names"] = list(
+                            set(var_names) | set(kwargs["var_names"])
+                        )
+                    elif kwargs["var_names"] is None:
+                        kwargs["var_names"] = var_names
+                    else:
+                        raise ValueError(
+                            "`var_names` must be a string, a list of strings, or None."
+                        )
+                else:
+                    kwargs["var_names"] = var_names
+
+        az.plot_trace(data, **kwargs)
+
+        if tight_layout:
+            plt.tight_layout()
+
+    def summary(
+        self,
+        data: az.InferenceData | None = None,
+        include_deterministic: bool = False,
+        **kwargs,
+    ) -> pd.DataFrame | xr.Dataset:
+        """Produce a summary table with ArviZ but with additional convenience features.
+
+        This is a simple wrapper for the az.summary() function. By default, it
+        filters out the deterministic values from the plot. Please see the
+        [arviz documentation]
+        (https://arviz-devs.github.io/arviz/api/generated/arviz.summary.html)
+        for additional parameters that can be specified.
+
+        Parameters
+        ----------
+        data
+            An ArviZ InferenceData object. If None, the traces stored in the model will
+            be used.
+        include_deterministic : optional
+            Whether to include deterministic variables in the plot. Defaults to False.
+            Note that if include_deterministic is set to False and and `var_names` is
+            provided, the `var_names` provided will be modified to also exclude the
+            deterministic values. If this is not desirable, set
+            `include_deterministic` to True.
+
+        Returns
+        -------
+        pd.DataFrame | xr.Dataset
+            A pandas DataFrame or xarray Dataset containing the summary statistics.
+        """
+        data = data or self.traces
+
+        if not include_deterministic:
+            var_names = self._get_deterministic_var_names(data)
+            if var_names:
+                kwargs["var_names"] = list(set(var_names + kwargs.get("var_names", [])))
+
+        return az.summary(data, **kwargs)
 
     def __repr__(self) -> str:
         """Create a representation of the model."""
@@ -659,6 +893,8 @@ class HSSM:
         """Process kwargs and p_outlier and add them to include."""
         if include is None:
             include = []
+        else:
+            include = include.copy()
         params_in_include = [param["name"] for param in include]
 
         # Process kwargs
@@ -720,8 +956,7 @@ class HSSM:
                     bounds = self.model_config.bounds.get(param_str)
                     param = Param(
                         param_str,
-                        formula="1 + (1|participant_id)",
-                        link="identity",
+                        formula=f"{param_str} ~ 1 + (1|participant_id)",
                         bounds=bounds,
                     )
                 else:
@@ -762,8 +997,29 @@ class HSSM:
         param.set_parent()
         return param_str, param
 
+    def _override_defaults(self):
+        """Override the default priors or links."""
+        is_ddm = (
+            self.model_name in ["ddm", "ddm_sdv", "ddm_full"]
+            and self.loglik_kind != "approx_differentiable"
+        )
+        for param in self.list_params:
+            param_obj = self.params[param]
+            if self.prior_settings == "safe":
+                if is_ddm:
+                    param_obj.override_default_priors_ddm(
+                        self.data, self.additional_namespace
+                    )
+                else:
+                    param_obj.override_default_priors(
+                        self.data, self.additional_namespace
+                    )
+            if self.link_settings == "log_logit":
+                param_obj.override_default_link()
+
     def _process_all(self):
         """Process all params."""
+        assert self.list_params is not None
         for param in self.list_params:
             self.params[param].convert()
 
@@ -835,7 +1091,7 @@ class HSSM:
                 lapse=self.lapse,
                 extra_fields=None
                 if not self.extra_fields
-                else [self.data[field].values for field in self.extra_fields],
+                else [deepcopy(self.data[field].values) for field in self.extra_fields],
             )  # type: ignore
         # If the user has provided a callable (an arbitrary likelihood function)
         # If `loglik_kind` is `blackbox`, wrap it in an op and then a distribution
@@ -852,7 +1108,7 @@ class HSSM:
                 lapse=self.lapse,
                 extra_fields=None
                 if not self.extra_fields
-                else [self.data[field].values for field in self.extra_fields],
+                else [deepcopy(self.data[field].values) for field in self.extra_fields],
             )  # type: ignore
         # All other situations
         if self.loglik_kind != "approx_differentiable":
@@ -881,7 +1137,7 @@ class HSSM:
             lapse=self.lapse,
             extra_fields=None
             if not self.extra_fields
-            else [self.data[field].values for field in self.extra_fields],
+            else [deepcopy(self.data[field].values) for field in self.extra_fields],
         )
 
     def _check_extra_fields(self, data: pd.DataFrame | None = None) -> bool:
@@ -912,3 +1168,15 @@ class HSSM:
         self.model_distribution.extra_fields = [
             new_data[field].values for field in self.extra_fields
         ]
+
+    def _get_deterministic_var_names(self, idata) -> list[str]:
+        """Filter out the deterministic variables in var_names."""
+        var_names = [
+            f"~{param_name}"
+            for param_name, param in self.params.items()
+            if param.is_regression and not param.is_parent
+        ]
+
+        if "rt,response_mean" in idata["posterior"].data_vars:
+            var_names.append("~rt,response_mean")
+        return var_names

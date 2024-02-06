@@ -9,17 +9,16 @@ these representations in Bambi-compatible formats through convenience function
 _parse_bambi().
 """
 
-from __future__ import annotations
-
 import logging
-from copy import deepcopy
 from typing import Any, Iterable, Literal, NewType
 
 import bambi as bmb
+import numpy as np
 import pytensor
+import xarray as xr
 from bambi.terms import CommonTerm, GroupSpecificTerm, HSGPTerm, OffsetTerm
 from huggingface_hub import hf_hub_download
-from jax.config import config
+from jax import config
 from pymc.model_graph import ModelGraph
 from pytensor import function
 
@@ -52,17 +51,6 @@ def download_hf(path: str):
      hf_hub_download function.
     """
     return hf_hub_download(repo_id=REPO_ID, filename=path)
-
-
-def merge_dicts(dict1: dict, dict2: dict) -> dict:
-    """Recursively merge two dictionaries."""
-    merged = deepcopy(dict1)
-    for key, value in dict2.items():
-        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
-            merged[key] = merge_dicts(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
 
 
 def make_alias_dict_from_parent(parent: Param) -> dict[str, str]:
@@ -336,7 +324,7 @@ def _process_param_in_kwargs(
     Raises
     ------
     ValueError
-        When `prior` is not a `float`, a `dict`, or a `b`mb.Prior` object.
+        When `prior` is not a `float`, a `dict`, or a `bmb.Prior` object.
     """
     if isinstance(prior, (int, float, bmb.Prior)):
         return {"name": name, "prior": prior}
@@ -353,3 +341,77 @@ def _process_param_in_kwargs(
             f"Parameter {name} must be a float, a dict, a bmb.Prior, "
             + "or a hssm.Param object."
         )
+
+
+def _generate_random_indices(
+    n_samples: int | float | None, n_draws: int
+) -> np.ndarray | None:
+    """Generate random indices for sampling an InferenceData object.
+
+    Parameters
+    ----------
+    n_samples
+        When an interger >= 1, the number of samples to be extracted from the draw
+        dimension. If this integer is larger than n_draws, returns None, which means
+        all samples are extracted. When a float between 0 and 1, the proportion of
+        samples to be extracted from the draw dimension. If this proportion is very
+        small, at least one sample will be drawn. When None, returns None.
+    n_draws
+        The number of total draws in the InferenceData object.
+
+    Returns
+    -------
+    np.ndarray
+        A 2D array of shape (n_chains, n_draws) with random indices or None, which means
+        using the entire dataset without random sampling.
+    """
+    if n_draws <= 0:
+        raise ValueError("n_draws must be >= 1.")
+
+    if n_samples is None:
+        return None
+
+    if n_samples > n_draws:
+        _logger.warning("n_samples > n_draws. Using the entire dataset.")
+        return None
+
+    if isinstance(n_samples, float):
+        if n_samples <= 0 or n_samples > 1:
+            raise ValueError("When a float, n_samples must be between 0 and 1.")
+        n_samples = max(int(n_samples * n_draws), 1)
+
+    if n_samples < 1:
+        raise ValueError("When an int, n_samples must be >= 1.")
+
+    sampling_indices = np.random.choice(n_draws, size=n_samples, replace=False)
+
+    return sampling_indices
+
+
+def _random_sample(
+    data: xr.DataArray | xr.Dataset, n_samples: int | float | None
+) -> xr.DataArray | xr.Dataset:
+    """Randomly sample a DataArray or Dataset.
+
+    Parameters
+    ----------
+    data
+        A DataArray or Dataset to be sampled.
+    n_samples
+        When an interger >= 1, the number of samples to be extracted from the draw
+        dimension. If this integer is larger than n_draws, returns None, which means
+        all samples are extracted. When a float between 0 and 1, the proportion of
+        samples to be extracted from the draw dimension. If this proportion is very
+        small, at least one sample will be drawn. When None, returns None.
+
+    Returns
+    -------
+    xr.DataArray | xr.Dataset
+        The sampled InferenceData object.
+    """
+    n_draws = data.draw.size
+    sampling_indices = _generate_random_indices(n_samples, n_draws)
+
+    if sampling_indices is None:
+        return data
+    return data.isel(draw=sampling_indices)

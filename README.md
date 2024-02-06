@@ -31,13 +31,13 @@ HSSM is a Python toolbox that provides a seamless combination of state-of-the-ar
 
 ## Installation
 
-`hssm` is available through PyPI. You can install it with Pip via:
+`hssm` is available through PyPI. You can install it with pip via:
 
 ```
 pip install hssm
 ```
 
-You can also install the bleeding edge version of `hssm` directly from this repo:
+You can also install the bleeding-edge version of `hssm` directly from this repo:
 
 ```
 pip install git+https://github.com/lnccbrown/HSSM.git
@@ -47,7 +47,12 @@ You will need optional dependencies to use JAX-based samplers and graph the mode
 Please refer to our [installation guide](https://lnccbrown.github.io/HSSM/getting_started/installation/)
 for more detailed instructions.
 
-**Note**: Possible solutions to any issues with installations with hssm can be located [here](https://github.com/lnccbrown/HSSM/discussions). We recommend leveraging an environment manager with Python 3.9~3.11 to prevent any problems with dependencies during the installation process. Please note that hssm is tested for python 3.9, 3.10, 3.11. Use other python versions with caution.
+**Note**: Possible solutions to any issues with installations with hssm can be located
+[here](https://github.com/lnccbrown/HSSM/discussions). We recommend leveraging an
+environment manager with Python 3.10~3.11 to prevent any problems with dependencies
+during the installation process. Please note that hssm is tested for python 3.10,
+3.11. As of HSSM v0.2.0, support for Python 3.9 is dropped. Use other python
+versions with caution.
 
 ## Example
 
@@ -71,8 +76,8 @@ model = hssm.HSSM(
         {
             "name": "v",
             "prior": {
-                "Intercept": {"name": "Normal", "mu": 0.0, "sigma": 0.0},
-                "theta": {"name": "Normal", "mu": 0.0, "sigma": 0.0},
+                "Intercept": {"name": "Normal", "mu": 0.0, "sigma": 0.1},
+                "theta": {"name": "Normal", "mu": 0.0, "sigma": 0.1},
             },
             "formula": "v ~ (1|participant_id) + theta",
             "link": "identity",

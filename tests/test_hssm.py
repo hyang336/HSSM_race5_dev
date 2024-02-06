@@ -2,56 +2,39 @@ from pathlib import Path
 
 import bambi as bmb
 import numpy as np
-import pandas as pd
-import pytensor
 import pytest
-import ssms
 
+import hssm
 from hssm import HSSM
 from hssm.utils import download_hf
 from hssm.likelihoods import DDM, logp_ddm
 
-pytensor.config.floatX = "float32"
+hssm.set_floatX("float32")
+
+param_v = {
+    "name": "v",
+    "prior": {
+        "Intercept": {"name": "Uniform", "lower": -3.0, "upper": 3.0},
+        "x": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
+        "y": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
+    },
+    "formula": "v ~ 1 + x + y",
+}
+
+param_a = param_v | dict(name="a", formula="a ~ 1 + x + y")
 
 
 @pytest.mark.parametrize(
     "include, should_raise_exception",
     [
         (
-            [
-                {
-                    "name": "v",
-                    "prior": {
-                        "Intercept": {"name": "Uniform", "lower": -3.0, "upper": 3.0},
-                        "x": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                        "y": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                    },
-                    "formula": "v ~ 1 + x + y",
-                    "link": "identity",
-                }
-            ],
+            [param_v],
             False,
         ),
         (
             [
-                {
-                    "name": "v",
-                    "prior": {
-                        "Intercept": {"name": "Uniform", "lower": -2.0, "upper": 3.0},
-                        "x": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                        "y": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                    },
-                    "formula": "v ~ 1 + x + y",
-                },
-                {
-                    "name": "a",
-                    "prior": {
-                        "Intercept": {"name": "Uniform", "lower": -2.0, "upper": 3.0},
-                        "x": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                        "y": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
-                    },
-                    "formula": "a ~ 1 + x + y",
-                },
+                param_v,
+                param_a,
             ],
             False,
         ),
@@ -206,7 +189,7 @@ def test_sample_prior_predictive(data_ddm_reg):
     )
     prior_predictive_5 = model_regression_multi.sample_prior_predictive(draws=10)
 
-    data_ddm_reg["subject_id"] = np.arange(10)
+    data_ddm_reg.loc[:, "subject_id"] = np.arange(10)
 
     model_regression_random_effect = HSSM(
         data=data_ddm_reg,
@@ -224,21 +207,28 @@ def test_hierarchical(data_ddm):
     data_ddm = data_ddm.iloc[:10, :].copy()
     data_ddm["participant_id"] = np.arange(10)
 
-    model = HSSM(data=data_ddm)
+    model = HSSM(data=data_ddm, hierarchical=True)
     assert all(
         param.is_regression
         for name, param in model.params.items()
         if name != "p_outlier"
     )
+    assert model.prior_settings == "safe"
 
-    model = HSSM(data=data_ddm, v=bmb.Prior("Uniform", lower=-10.0, upper=10.0))
+    model = HSSM(
+        data=data_ddm,
+        v=bmb.Prior("Uniform", lower=-10.0, upper=10.0),
+        hierarchical=True,
+    )
     assert all(
         param.is_regression
         for name, param in model.params.items()
         if name not in ["v", "p_outlier"]
     )
 
-    model = HSSM(data=data_ddm, a=bmb.Prior("Uniform", lower=0.0, upper=10.0))
+    model = HSSM(
+        data=data_ddm, a=bmb.Prior("Uniform", lower=0.0, upper=10.0), hierarchical=True
+    )
     assert all(
         param.is_regression
         for name, param in model.params.items()
@@ -249,9 +239,40 @@ def test_hierarchical(data_ddm):
         data=data_ddm,
         v=bmb.Prior("Uniform", lower=-10.0, upper=10.0),
         a=bmb.Prior("Uniform", lower=0.0, upper=10.0),
+        hierarchical=True,
     )
     assert all(
         param.is_regression
         for name, param in model.params.items()
         if name not in ["v", "a", "p_outlier"]
     )
+
+
+def test_override_default_link(caplog, data_ddm_reg):
+    param_v = {
+        "name": "v",
+        "prior": {
+            "Intercept": {"name": "Uniform", "lower": -3.0, "upper": 3.0},
+            "x": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
+            "y": {"name": "Uniform", "lower": -0.50, "upper": 0.50},
+        },
+        "formula": "v ~ 1 + x + y",
+    }
+    param_v = param_v | dict(bounds=(-np.inf, np.inf))
+    param_a = param_v | dict(name="a", formula="a ~ 1 + x + y", bounds=(0, np.inf))
+    param_z = param_v | dict(name="z", formula="z ~ 1 + x + y", bounds=(0, 1))
+    param_t = param_v | dict(name="t", formula="t ~ 1 + x + y", bounds=(0.1, np.inf))
+
+    model = HSSM(
+        data=data_ddm_reg,
+        include=[param_v, param_a, param_z, param_t],
+        link_settings="log_logit",
+    )
+
+    assert model.params["v"].link == "identity"
+    assert model.params["a"].link == "log"
+    assert model.params["z"].link.name == "gen_logit"
+    assert model.params["t"].link == "identity"
+
+    assert "t" in caplog.records[0].message
+    assert "strange" in caplog.records[0].message

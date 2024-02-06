@@ -5,21 +5,32 @@ Heavily influenced by Arviz's(scikit-learn's, and Bambi's) implementation.
 """
 
 import os
-from collections import namedtuple
-from typing import Optional, Union
+from typing import NamedTuple, Optional, Union
 
 import pandas as pd
 
 base_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 
-FileMetadata = namedtuple("FileMetadata", ["filename", "path", "description"])
+
+class FileMetadata(NamedTuple):
+    """Typing for dataset metadata."""
+
+    filename: str
+    path: str
+    description: str
+
 
 DATASETS = {
     "cavanagh_theta": FileMetadata(
         filename="cavanagh_theta",
         path=os.path.join(base_dir, "hssm/datasets/cavanagh_theta_nn.csv"),
         description="Description for cavanagh_theta dataset",
-    )
+    ),
+    "cavanagh_theta_old": FileMetadata(
+        filename="cavanagh_theta",
+        path=os.path.join(base_dir, "hssm/datasets/cavanagh_theta_nn_old.csv"),
+        description="Description for the original cavanagh_theta dataset",
+    ),
 }
 
 

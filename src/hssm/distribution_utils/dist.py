@@ -5,11 +5,9 @@ distributions that support arbitrary log-likelihood functions and random number
 generation ops.
 """
 
-from __future__ import annotations
-
 import logging
 from os import PathLike
-from typing import Any, Callable, Iterable, Type
+from typing import Any, Callable, Type
 
 import bambi as bmb
 import numpy as np
@@ -31,7 +29,7 @@ LogLikeGrad = Callable[..., ArrayLike]
 
 _logger = logging.getLogger("hssm")
 
-OUT_OF_BOUNDS_VAL = pm.floatX(-66.1)
+LOGP_LB = pm.floatX(-66.1)
 
 
 def apply_param_bounds_to_loglik(
@@ -73,9 +71,49 @@ def apply_param_bounds_to_loglik(
         param_mask = pt.bitwise_or(pt.lt(param, lower_bound), pt.gt(param, upper_bound))
         out_of_bounds_mask = pt.bitwise_or(out_of_bounds_mask, param_mask)
 
-    logp = pt.where(out_of_bounds_mask, OUT_OF_BOUNDS_VAL, logp)
+    logp = pt.where(out_of_bounds_mask, LOGP_LB, logp)
 
     return logp
+
+
+def ensure_positive_ndt(data, logp, list_params, dist_params):
+    """Ensure that the non-decision time is always positive.
+
+    Replaces the log probability of the model with a lower bound if the non-decision
+    time is not positive.
+
+    Parameters
+    ----------
+    data
+        A two-column numpy array with response time and response.
+    logp
+        The log-likelihoods.
+    list_params
+        A list of parameters that the log-likelihood accepts. The order of the
+        parameters in the list will determine the order in which the parameters
+        are passed to the log-likelihood function.
+    dist_params
+        A list of parameters used in the likelihood computation. The parameters
+        can be both scalars and arrays.
+
+    Returns
+    -------
+    float
+        The log-likelihood of the model.
+    """
+    rt = data[:, 0]
+
+    if "t" not in list_params:
+        return logp
+
+    t = dist_params[list_params.index("t")]
+
+    return pt.where(
+        # consistent with the epsilon in the analytical likelihood
+        rt - t <= 1e-15,
+        LOGP_LB,
+        logp,
+    )
 
 
 def make_ssm_rv(
@@ -281,19 +319,24 @@ def make_ssm_rv(
                 )
                 out_shape = sims_out.shape[:-1]
                 replace = rng.binomial(n=1, p=p_outlier, size=out_shape).astype(bool)
-                replace = np.stack([replace, replace], axis=-1)
-                n_draws = np.prod(out_shape)
+                replace_n = int(np.sum(replace, axis=None))
+                if replace_n == 0:
+                    return sims_out
+                replace_shape = (*out_shape[:-1], replace_n)
+                replace_mask = np.stack([replace, replace], axis=-1)
+                n_draws = np.prod(replace_shape)
                 lapse_rt = pm.draw(
                     get_distribution_from_prior(cls._lapse).dist(**cls._lapse.args),
                     n_draws,
                     random_seed=rng,
-                ).reshape(out_shape)
-                lapse_response = rng.binomial(n=1, p=0.5, size=out_shape)
+                ).reshape(replace_shape)
+                lapse_response = rng.binomial(n=1, p=0.5, size=replace_shape)
+                lapse_response = np.where(lapse_response == 1, 1, -1)
                 lapse_output = np.stack(
                     [lapse_rt, lapse_response],
                     axis=-1,
                 )
-                np.putmask(sims_out, replace, lapse_output)
+                np.putmask(sims_out, replace_mask, lapse_output)
 
             return sims_out
 
@@ -381,7 +424,7 @@ def make_distribution(
 
         def logp(data, *dist_params):  # pylint: disable=E0213
             num_params = len(list_params)
-            extra_fields: Iterable[np.ndarray] = []
+            extra_fields = []
 
             if num_params < len(dist_params):
                 extra_fields = dist_params[num_params:]
@@ -401,12 +444,14 @@ def make_distribution(
             else:
                 logp = loglik(data, *dist_params, *extra_fields)
 
-            if bounds is None:
-                return logp
+            if bounds is not None:
+                logp = apply_param_bounds_to_loglik(
+                    logp, list_params, *dist_params, bounds=bounds
+                )
 
-            return apply_param_bounds_to_loglik(
-                logp, list_params, *dist_params, bounds=bounds
-            )
+            # Ensure that non-decision time is always smaller than rt.
+            # Assuming that the non-decision time parameter is always named "t".
+            return ensure_positive_ndt(data, logp, list_params, dist_params)
 
     return SSMDistribution
 
